@@ -116,7 +116,7 @@ class Preprocessing(dj.Lookup):
 
     @property
     def contents(self):
-        yield from zip(count(), [30, 30, 30], [2.5, 2.5, 2.5], [36, 36, 36], [64, 64, 64])
+        yield from zip(count(), [30, 30, 30, 30], [2.5, 2.5, 2.5, 2.5], [36, 36, 36, 72], [64, 64, 64, 128])
 
 
 @schema

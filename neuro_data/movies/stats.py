@@ -5,6 +5,7 @@ from pprint import pformat
 import datajoint as dj
 
 from attorch.dataset import H5SequenceSet
+from scipy.interpolate import interp1d
 
 from neuro_data.movies.transforms import Subsequence
 from neuro_data.utils.measures import corr
@@ -21,7 +22,7 @@ from tqdm import tqdm
 from scipy import stats
 from scipy.signal import convolve2d
 from ..utils.data import SplineMovie, FilterMixin, SplineCurve, h5cached, NaNSpline, fill_nans
-from .data_schemas import MovieMultiDataset, MovieScan
+from .data_schemas import MovieMultiDataset, MovieScan, MovieClips
 from .configs import DataConfig
 
 schema = dj.schema('neurodata_moviestats', locals())
@@ -441,3 +442,45 @@ class BootstrapOracleTTest(dj.Computed):
         self.PValue().insert1(dict(key, p_value=p_value))
         self.UnitPValue().insert([dict(key, unit_id=u, unit_p_value=upv)
                                   for u, upv in zip(unit_ids, unit_p_values)])
+
+
+
+@schema
+class MonetDirections(dj.Computed):
+    definition = """
+    # directions corresponding to the monet stimulus
+
+    -> MovieClips
+    ---
+    directions    : longblob   # movement directions at the points where drifting is true
+    drifting      : longblob   # whether there was movement or not
+    """
+
+    @property
+    def key_source(self):
+        return MovieClips() & [stimulus.Monet().proj('speed') & 'speed > 0',
+                               stimulus.Monet2().proj('speed', 'ori_coherence') & 'speed > 0 and ori_coherence>1']
+
+    def make(self, key):
+        log.info('Populating {}'.format(pformat(key)))
+        monet2 = False
+        if stimulus.Monet() & key:
+            monet = stimulus.Monet()
+        else:
+            monet2 = True
+            monet = stimulus.Monet2().proj('onsets', 'directions', 'speed', 'fps',
+                                           ori_on_secs='floor(1000*duration/n_dirs*ori_fraction)/1000')
+        dirs, onsets, ori_on_secs = (monet & key).fetch1('directions', 'onsets', 'ori_on_secs')
+        dirs, onsets = list(map(np.squeeze, [dirs, onsets]))
+        time_points = np.zeros(2 * onsets.size)
+        time_points[::2] = onsets
+        time_points[1::2] = onsets + ori_on_secs
+        directions = np.nan * time_points
+        directions[::2] = np.round(dirs if not monet2 else dirs / 180 * np.pi, decimals=4).astype(np.float32)
+        f = interp1d(time_points, directions, kind='zero', bounds_error=False, fill_value=np.nan)
+        sample_points = (MovieClips() & key).fetch1('sample_times').squeeze()
+        idirs = f(np.array(sample_points))
+        idx = ~np.isnan(idirs)
+        key['drifting'] = idx
+        key['directions'] = idirs[idx]
+        self.insert1(key)
