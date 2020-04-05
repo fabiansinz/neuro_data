@@ -535,7 +535,7 @@ class InputResponse(dj.Computed, FilterMixin):
         self.Input.insert([dict(scan_key, **trial_key, row_id=i)
                            for i, trial_key in enumerate(compress(trial_keys, valid))])
 
-    def compute_data(self, key):
+    def compute_data(self, key, include_behavior=None):
         key = dict((self & key).fetch1(dj.key), **key)
         log.info('Computing dataset for\n' + pformat(key, indent=20))
 
@@ -544,9 +544,13 @@ class InputResponse(dj.Computed, FilterMixin):
         pipe = dj.create_virtual_module(pipe, 'pipeline_' + pipe)
 
         # get data relation
-        include_behavior = bool(Eye.proj() * Treadmill.proj() & key)
+        if include_behavior is None:
+            include_behavior = bool(Eye.proj() * Treadmill.proj() & key)
+            assert include_behavior, 'Behavior data is missing!'
+        else:
+            log.warn('Including behavioral data was enforced to {}'.format(include_behavior))
 
-        assert include_behavior, 'Behavior data is missing!'
+
 
         # make sure that including areas and layers does not decrease number of neurons
         assert len(pipe.ScanSet.UnitInfo() * experiment.Layer() * anatomy.AreaMembership() * anatomy.LayerMembership() & key) == \

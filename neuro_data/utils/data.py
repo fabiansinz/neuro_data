@@ -313,10 +313,13 @@ class h5cached:
                     return tmpfile
             return cachefile
 
-        def fetch1_data(oself, key=None, **kwargs):
-            filename = oself._get_filename(key, **kwargs)
+        def fetch1_data(oself, key=None, filename=None, **kwargs):
+            overwrite = filename is not None
+            if filename is None:
+                filename = oself._get_filename(key, **kwargs)
 
-            if not os.path.isfile(filename):
+
+            if not os.path.isfile(filename) or overwrite:
                 print('Computing data and saving to', filename, flush=True)
                 data = oself.compute_data(key, **kwargs)
                 save_dict_to_hdf5(data, filename)
