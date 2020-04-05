@@ -5,6 +5,7 @@ from pprint import pformat
 import datajoint as dj
 
 from attorch.dataset import H5SequenceSet
+from scipy.interpolate import interp1d
 
 from neuro_data.movies.transforms import Subsequence
 from neuro_data.utils.measures import corr
@@ -21,7 +22,7 @@ from tqdm import tqdm
 from scipy import stats
 from scipy.signal import convolve2d
 from ..utils.data import SplineMovie, FilterMixin, SplineCurve, h5cached, NaNSpline, fill_nans
-from .data_schemas import MovieMultiDataset, MovieScan
+from .data_schemas import MovieMultiDataset, MovieScan, MovieClips
 from .configs import DataConfig
 
 schema = dj.schema('neurodata_moviestats', locals())
@@ -272,7 +273,7 @@ class BootstrapOracle(dj.Computed):
     def key_source(self):
         from .data_schemas import MovieMultiDataset
         return super().key_source & (
-            MovieMultiDataset.Member & 'group_id in (0, 1, 9)')
+            MovieMultiDataset.Member & 'group_id in (0, 1, 2, 9, 15, 16, 17)')
 
     def sample_from_condition_hash(self, target_hash, dataset, sample_size):
         return np.random.choice(np.where(dataset == target_hash)[0], sample_size, replace=False)
@@ -412,8 +413,9 @@ class BootstrapOracleTTest(dj.Computed):
 
     def make(self, key):
         num_seeds = len(BootstrapOracleSeed())
-
-        unit_ids = (MovieScan.Unit & key).fetch('unit_id')
+        
+        dset = load_dataset(key)
+        unit_ids = dset.neurons.unit_ids
         unit_scores = pd.DataFrame((BootstrapOracle.UnitScore & key).fetch())
 
         assert len(unit_scores) == num_seeds * len(unit_ids)
@@ -424,16 +426,61 @@ class BootstrapOracleTTest(dj.Computed):
             mean_scores.boostrap_unit_score_true.values, mean_scores.boostrap_unit_score_null.values)
 
         # Computing unit scores
+        scores_true = unit_scores.pivot(
+                index='unit_id', columns='oracle_bootstrap_seed',
+                values='boostrap_unit_score_true')
+        scores_null = unit_scores.pivot(
+            index='unit_id', columns='oracle_bootstrap_seed',
+            values='boostrap_unit_score_null')
         _, unit_p_values = stats.ttest_ind(
-            unit_scores.pivot(
-                index='unit_id', columns='oracle_bootstrap_seed',
-                values='boostrap_unit_score_true').values,
-            unit_scores.pivot(
-                index='unit_id', columns='oracle_bootstrap_seed',
-                values='boostrap_unit_score_null').values, axis=1,
-            equal_var=False)
+            scores_true.values, scores_null.values, 
+            axis=1, equal_var=False)
+        assert np.array_equal(scores_true.index.values, scores_null.index.values)
+        assert np.array_equal(scores_true.index.values, unit_ids)
 
         self.insert1(key)
         self.PValue().insert1(dict(key, p_value=p_value))
         self.UnitPValue().insert([dict(key, unit_id=u, unit_p_value=upv)
                                   for u, upv in zip(unit_ids, unit_p_values)])
+
+
+
+@schema
+class MonetDirections(dj.Computed):
+    definition = """
+    # directions corresponding to the monet stimulus
+
+    -> MovieClips
+    ---
+    directions    : longblob   # movement directions at the points where drifting is true
+    drifting      : longblob   # whether there was movement or not
+    """
+
+    @property
+    def key_source(self):
+        return MovieClips() & [stimulus.Monet().proj('speed') & 'speed > 0',
+                               stimulus.Monet2().proj('speed', 'ori_coherence') & 'speed > 0 and ori_coherence>1']
+
+    def make(self, key):
+        log.info('Populating {}'.format(pformat(key)))
+        monet2 = False
+        if stimulus.Monet() & key:
+            monet = stimulus.Monet()
+        else:
+            monet2 = True
+            monet = stimulus.Monet2().proj('onsets', 'directions', 'speed', 'fps',
+                                           ori_on_secs='floor(1000*duration/n_dirs*ori_fraction)/1000')
+        dirs, onsets, ori_on_secs = (monet & key).fetch1('directions', 'onsets', 'ori_on_secs')
+        dirs, onsets = list(map(np.squeeze, [dirs, onsets]))
+        time_points = np.zeros(2 * onsets.size)
+        time_points[::2] = onsets
+        time_points[1::2] = onsets + ori_on_secs
+        directions = np.nan * time_points
+        directions[::2] = np.round(dirs if not monet2 else dirs / 180 * np.pi, decimals=4).astype(np.float32)
+        f = interp1d(time_points, directions, kind='zero', bounds_error=False, fill_value=np.nan)
+        sample_points = (MovieClips() & key).fetch1('sample_times').squeeze()
+        idirs = f(np.array(sample_points))
+        idx = ~np.isnan(idirs)
+        key['drifting'] = idx
+        key['directions'] = idirs[idx]
+        self.insert1(key)

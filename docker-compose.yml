@@ -7,7 +7,7 @@ services:
     ports:
       - "7777:8888"
     volumes:
-      - $HOME/Dropbox/notebooks/neuro_data:/notebooks
+      - $HOME/Dropbox/sinzlab/resources/notebooks/baylor:/notebooks
       - /tmp:/tmp
       - /tmp/.X11-unix:/tmp/.X11-unix
       - /home/fabee/code/neuro_data:/src/neuro_data
