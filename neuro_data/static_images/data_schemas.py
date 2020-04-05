@@ -1,160 +1,61 @@
 from collections import OrderedDict
 from functools import partial
-from itertools import count, compress
+from itertools import compress
 from pprint import pformat
 
 import datajoint as dj
 import numpy as np
 import pandas as pd
 
-from .datasets import StaticImageSet
-from .. import logger as log
-from ..utils.data import h5cached, SplineCurve, FilterMixin, fill_nans, NaNSpline
+from neuro_data import logger as log
+from neuro_data.utils.data import h5cached, SplineCurve, FilterMixin, fill_nans, NaNSpline
+from neuro_data.static_images import datasets
 
-dj.config['external-data'] = dict(
-    protocol='file',
-    location='/external/')
+dj.config['external-data'] = {'protocol': 'file', 'location': '/external/'}
 
-# Day 1: 2-24 ImageNet - used to generate MEIs, 3-7 Repeat ImageNet
-# Day 2: 4-19 MEIs - incorrect depths, 4-29 Repeat ImageNet - incorrect depths
-# Day 3: 5-26 MEIs,  6-1 Repeat ImageNet
-# Day 4: 7-23 MEIs, 7-29 Repeat ImageNet
-STATIC = [
-    '(animal_id=11521 AND session=7 AND scan_idx=1)',
-    '(animal_id=11521 AND session=7 AND scan_idx=2)',
-    '(animal_id=16157 AND session=5 AND scan_idx=5)',
-    '(animal_id=16157 AND session=5 AND scan_idx=6)',
-    '(animal_id=16312 AND session=3 AND scan_idx=20)',
-    '(animal_id=18765 AND session=4 AND scan_idx=6)',
-    '(animal_id=18765 AND session=7 AND scan_idx=17)',
-    '(animal_id=21067 AND session=15 AND scan_idx=9)',  # 360 images x 20 repeatitions (for Zhe)
-]
+experiment = dj.create_virtual_module('experiment', 'pipeline_experiment')
+reso = dj.create_virtual_module('reso', 'pipeline_reso')
+meso = dj.create_virtual_module('meso', 'pipeline_meso')
+fuse = dj.create_virtual_module('fuse', 'pipeline_fuse')
+pupil = dj.create_virtual_module('pupil', 'pipeline_eye')
+stimulus = dj.create_virtual_module('stimulus', 'pipeline_stimulus')
+shared = dj.create_virtual_module('shared', 'pipeline_shared')
+anatomy = dj.create_virtual_module('anatomy', 'pipeline_anatomy')
+treadmill = dj.create_virtual_module('treadmill', 'pipeline_treadmill')
 
-MEI_STATIC = [
-    '(animal_id=20505 AND session=2 AND scan_idx=24)', # loop 0 day 1 (Tue) source ImageNet
-    '(animal_id=20505 AND session=3 AND scan_idx=7)',  # loop 0 day 1 (Tue) repeat ImageNet repeat
-    '(animal_id=20505 AND session=5 AND scan_idx=26)', # loop 0 day 3 (Thu) MEI
-    '(animal_id=20505 AND session=6 AND scan_idx=1)',  # loop 0 day 3 (Thu) repeat ImageNet
-    '(animal_id=20505 AND session=7 AND scan_idx=23)', # loop 0 day 4 (Fri) MEI
-    '(animal_id=20505 AND session=7 AND scan_idx=29)', # loop 0 day 4 (Fri) repeat ImageNet
-
-    '(animal_id=20457 AND session=5 AND scan_idx=9)',  # loop 1 day 1 (Thu) source ImageNet
-    '(animal_id=20457 AND session=5 AND scan_idx=17)', # loop 1 day 1 (Thu) repeat ImageNet
-    '(animal_id=20457 AND session=5 AND scan_idx=27)', # loop 1 day 1 (Thu) Monet
-    #'(animal_id=20457 AND session=7 AND scan_idx=4)',  # loop 1 day 2 (Fri) MEI, sync failed
-    '(animal_id=20457 AND session=7 AND scan_idx=10)', # loop 1 day 2 (Fri) repeat ImageNet,
-    '(animal_id=20457 AND session=7 AND scan_idx=16)', # loop 1 day 2 (Fri) Monet,
-    '(animal_id=20457 AND session=8 AND scan_idx=9)',  # loop 1 day 3 (Mon) MEI,
-    '(animal_id=20457 AND session=8 AND scan_idx=12)', # loop 1 day 3 (Mon) repeat ImageNet
-    '(animal_id=20457 AND session=8 AND scan_idx=22)', # loop 1 day 3 (Mon) Monet
-
-    '(animal_id=20505 AND session=10 AND scan_idx=14)',  # loop 2 day 1 (Tue) source ImageNet
-    '(animal_id=20505 AND session=10 AND scan_idx=19)',  # loop 2 day 1 (Tue) repeat ImageNet
-    #'(animal_id=20505 AND session=11 AND scan_idx=7)',   # loop 2 day 2 (Wed) MEI - BAD: mouse not awake
-    '(animal_id=20505 AND session=11 AND scan_idx=16)',  # loop 2 day 2 (Wed) repeat ImageNet
-    '(animal_id=20505 AND session=12 AND scan_idx=16)',  # loop 2 day 3 (Thu) MEI
-    '(animal_id=20505 AND session=12 AND scan_idx=29)',  # loop 2 day 3 (Thu) repeat ImageNet
-    '(animal_id=20505 AND session=14 AND scan_idx=4)',   # loop 2 day 4 (Thu) MEI
-    '(animal_id=20505 AND session=14 AND scan_idx=33)',  # loop 2 day 4 (Thu) repeat ImageNet
-
-    '(animal_id=20210 AND session=4 AND scan_idx=11)',  # loop 3 day 1 (Tue) source ImageNet
-    #'(animal_id=20210 AND session=4 AND scan_idx=20)',  # loop 3 day 1 (Tue) ImageNet (alternative set of images)
-    #'(animal_id=20210 AND session=5 AND scan_idx=26)',  # loop 3 day 2 (Wed) MEI, eye secretion for half the scan
-    '(animal_id=20210 AND session=5 AND scan_idx=16)',  # loop 3 day 2 (Wed) repeat ImageNet
-    '(animal_id=20210 AND session=7 AND scan_idx=10)',  # loop 3 day 3 (Thu) MEI
-    '(animal_id=20210 AND session=7 AND scan_idx=14)',  # loop 3 day 3 (Thu) repeat ImageNet
-    #'(animal_id=20210 AND session=8 AND scan_idx=11)',  # loop 3 day 4 (Fri) Masked MEI vs Masked ImageNet, masking was wrong
-    '(animal_id=20210 AND session=8 AND scan_idx=17)',  # loop 3 day 4 (Fri) repeat ImageNet
-
-    '(animal_id=20892 AND session=3 AND scan_idx=14)',  # loop 4 day 1 (Tue, Jan 29) source ImageNet
-    #'(animal_id=20892 AND session=4 AND scan_idx=11)',  # loop 4 day 2 (Wed) MEI, kind of big bubble
-    '(animal_id=20892 AND session=4 AND scan_idx=16)',  # loop 4 day 2 (Wed) repeat ImageNet, small bubble
-    '(animal_id=20892 AND session=5 AND scan_idx=18)',  # loop 4 day 3 (Thu) MEI
-    #'(animal_id=20892 AND session=5 AND scan_idx=29)',  # loop 4 day 3 (Thu) repeat ImageNet, mouse was sleep half of the time
-    '(animal_id=20892 AND session=6 AND scan_idx=17)',  # loop 4 day 4 (Fri) MEI, small bubble
-    '(animal_id=20892 AND session=6 AND scan_idx=24)',  # loop 4 day 4 (Fri) repeat ImageNet
-
-    '(animal_id=21067 AND session=9 AND scan_idx=17)',  # loop 5 day 1 (Tue) source ImageNet
-    # '(animal_id=21067 AND session=9 AND scan_idx=23)',  # loop 5 day 1 (Tue) ImageNet (alternative set of images), Sync failed, do not use
-    '(animal_id=21067 AND session=10 AND scan_idx=14)', # loop 5 day 2 (Wed) MEI
-    '(animal_id=21067 AND session=10 AND scan_idx=18)', # loop 5 day 2 (Wed) repeat ImageNet
-    # '(animal_id=21067 AND session=11 AND scan_idx=12)', # loop 5 day 3 (Thu) MEI vs Gabor
-    '(animal_id=21067 AND session=11 AND scan_idx=21)', # loop 5 day 3 (Thu) repeat ImageNet
-    #'(animal_id=21067 AND session=12 AND scan_idx=11)', # loop 5 day 4 (Fri) Masked MEI vs Masked ImageNet
-    '(animal_id=21067 AND session=12 AND scan_idx=15)', # loop 5 day 4 (Fri) repeat ImageNet
-    # '(animal_id=21067 AND session=13 AND scan_idx=10)', # loop 5 day 5 (Mon) Masked MEI vs Unmasked Imagenet
-    '(animal_id=21067 AND session=13 AND scan_idx=14)', # loop 5 day 5 (Mon) repeat ImageNet
-]
-
-HIGHER_AREAS = [
-    '(animal_id=20892 AND session=9 AND scan_idx=10)', # ImageNet, single depth, big FOV, mostly V1
-    '(animal_id=20892 AND session=9 AND scan_idx=11)', # ImageNet, single depth, big FOV, mostly V1
-    '(animal_id=20892 AND session=10 AND scan_idx=10)', # ImageNet, V1+LM+AL+RL in a single rectangular FOV
-    '(animal_id=21553 AND session=11 AND scan_idx=10)', # ImageNet, V1+LM+AL+RL in a single rectangular FOV
-    '(animal_id=21844 AND session=2 AND scan_idx=12)', # ImageNet, V1+LM+AL+RL in four distinct rois
-    '(animal_id=22085 AND session=2 AND scan_idx=20)', # ImageNet, V1+LM+AL+RL in four distinct rois
-    '(animal_id=22083 AND session=7 AND scan_idx=21)', # ImageNet, V1+LM+AL+RL in four distinct rois
-]
-
-STATIC = STATIC + MEI_STATIC + HIGHER_AREAS
+schema = dj.schema('neurodata_static')
 
 # set of attributes that uniquely identifies the frame content
 UNIQUE_FRAME = {
     'stimulus.Frame': ('image_id', 'image_class'),
     'stimulus.MonetFrame': ('rng_seed', 'orientation'),
     'stimulus.TrippyFrame': ('rng_seed',),
+    'stimulus.ColorFrameProjector': ('image_id', 'image_class'),
 }
 
-experiment = dj.create_virtual_module('experiment', 'pipeline_experiment')
-meso = dj.create_virtual_module('meso', 'pipeline_meso')
-fuse = dj.create_virtual_module('fuse', 'pipeline_fuse')
-beh = dj.create_virtual_module('behavior', 'pipeline_behavior')
-pupil = dj.create_virtual_module('pupil', 'pipeline_eye')
-stimulus = dj.create_virtual_module('stimulus', 'pipeline_stimulus')
-vis = dj.create_virtual_module('vis', 'pipeline_vis')
-maps = dj.create_virtual_module('maps', 'pipeline_map')
-shared = dj.create_virtual_module('shared', 'pipeline_shared')
-anatomy = dj.create_virtual_module('anatomy', 'pipeline_anatomy')
-mesonet = dj.create_virtual_module('mesonet', 'cortex_ex_machina_mesonet_data')
-treadmill = dj.create_virtual_module('treadmill', 'pipeline_treadmill')
+IMAGE_CLASSES = 'image_class in ("imagenet", "imagenet_v2_gray", "imagenet_v2_rgb")' # all valid natural image classes
 
-schema = dj.schema('neurodata_static')
-
-extra_info_types = {
-    'condition_hash':'S',
-    'trial_idx':int,
-    'trial_idx':int,
-    'animal_id':int,
-    'session':int,
-    'scan_idx':int,
-    'image_class':'S',
-    'image_id':int,
-    'pre_blank_period':float,
-    'presentation_time':float,
-    'last_flip':int,
-    'trial_ts':'S',
-    'contrast_x':float,
-    'rng_seed_x':float,
-    'pattern_width':float,
-    'pattern_aspect':float,
-    'ori_coherence':float,
-    'ori_mix':float,
-    'orientation':float,
-    'contrast_y':float,
-    'rng_seed_y':float,
-    'tex_ydim':float,
-    'tex_xdim':float,
-    'xnodes':float,
-    'ynodes':float,
-    'up_factor':float,
-    'spatial_freq':float
-}
-
+@schema
+class StaticScanCandidate(dj.Manual):
+    definition = """ # list of scans to process
+    
+    -> fuse.ScanDone
+    ---
+    candidate_notes='' : varchar(1024)
+    """
+    @staticmethod
+    def fill(key, candidate_notes='', segmentation_method=6, spike_method=5,
+             pipe_version=1):
+        """ Fill an entry with key"""
+        StaticScanCandidate.insert1({'segmentation_method': segmentation_method,
+                                     'spike_method': spike_method,
+                                     'pipe_version': pipe_version, **key,
+                                     'candidate_notes': candidate_notes},
+                                    skip_duplicates=True)
 
 @schema
 class StaticScan(dj.Computed):
-    definition = """
-    # gatekeeper for scan and preprocessing settings
+    definition = """ # gatekeeper for scan and preprocessing settings
     
     -> fuse.ScanDone
     """
@@ -168,12 +69,12 @@ class StaticScan(dj.Computed):
         -> fuse.ScanSet.Unit
         """
 
-    key_source = fuse.ScanDone() & STATIC & 'spike_method=5 and segmentation_method=6'
+    key_source = fuse.ScanDone() & StaticScanCandidate & 'spike_method=5 and segmentation_method=6'
 
     @staticmethod
     def complete_key(key):
-        return dict((dj.U('segmentation_method', 'pipe_version') \
-                     & (meso.ScanSet.Unit() & key)).fetch1(dj.key), **key)
+        return dict((dj.U('segmentation_method', 'pipe_version') &
+                     (meso.ScanSet.Unit() & key)).fetch1(dj.key), **key)
 
     def make(self, key):
         self.insert(fuse.ScanDone() & key, ignore_extra_fields=True)
@@ -205,6 +106,71 @@ class ExcludedTrial(dj.Manual):
     exclusion_comment='': varchar(64)   # reasons for exclusion
     """
 
+# based on mesonet.MesoNetSplit
+@schema
+class ImageNetSplit(dj.Lookup):
+    definition = """ # split imagenet frames into train, test, validation
+
+    -> stimulus.StaticImage.Image
+    ---
+    -> Tier
+    """
+    def fill(self, scan_key):
+        """ Assign each imagenet frame in the current scan to train/test/validation set.
+
+        Arguments:
+            scan_key: An scan (animal_id, session, scan_idx) that has stimulus.Trials
+                created. Usually one where the stimulus was presented.
+
+        Note:
+            Each image is assigned to one set and that holds true for all our scans and
+            collections. Once an image has been assigned (and models have been trained
+            with that split), it cannot be changed in the future (this is problematic if
+            images are reused as those from collection 2 or collection 3 with a different
+            purpose).
+
+            The exact split assigned will depend on the scans used in fill and the order
+            that this table was filled. Not ideal.
+        """
+        # Find out whether we are using the old pipeline (grayscale only) or the new version
+        if stimulus.Frame & (stimulus.Trial & scan_key):
+            frame_table = stimulus.Frame
+        elif stimulus.ColorFrameProjector & (stimulus.Trial & scan_key):
+            frame_table = stimulus.ColorFrameProjector
+        else:
+            print('Static images were not shown for this scan')
+
+        # Get all image ids in this scan
+        all_frames = frame_table * stimulus.Trial & scan_key & IMAGE_CLASSES
+        unique_frames = dj.U('image_id', 'image_class').aggr(all_frames, repeats='COUNT(*)')
+        image_ids, image_classes = unique_frames.fetch('image_id', 'image_class', order_by='repeats DESC')
+        num_frames = len(image_ids)
+        # * NOTE: this fetches all oracle images first and the rest in a "random" order;
+        # we use that random order to make the validation/training division below.
+
+        # Get number of repeated frames
+        assert len(unique_frames) != 0, 'unique_frames == 0'
+
+        n = int(np.median(unique_frames.fetch('repeats')))  # HACK
+        num_oracles = len(unique_frames & 'repeats > {}'.format(n))  # repeats
+        if num_oracles == 0:
+            raise ValueError('Could not find repeated frames to use for oracle.')
+
+        # Compute number of validation examples
+        num_validation = int(np.ceil((num_frames - num_oracles) * 0.1))  # 10% validation examples
+
+        # Insert
+        self.insert([{'image_id': iid, 'image_class': ic, 'tier': 'test'} for iid, ic in
+                     zip(image_ids[:num_oracles], image_classes[:num_oracles])],
+                    skip_duplicates=True)
+        self.insert([{'image_id': iid, 'image_class': ic, 'tier': 'validation'} for
+                     iid, ic in zip(image_ids[num_oracles: num_oracles + num_validation],
+                                    image_classes[num_oracles: num_oracles + num_validation])])
+        self.insert([{'image_id': iid, 'image_class': ic, 'tier': 'train'} for iid, ic in
+                     zip(image_ids[num_oracles + num_validation:],
+                         image_classes[num_oracles + num_validation:])])
+
+
 @schema
 class ConditionTier(dj.Computed):
     definition = """
@@ -228,9 +194,10 @@ class ConditionTier(dj.Computed):
 
     def check_train_test_split(self, frames, cond):
         stim = getattr(stimulus, cond['stimulus_type'].split('.')[-1])
-        train_test = dj.U(*UNIQUE_FRAME[cond['stimulus_type']]).aggr(frames * stim, train='sum(1-test)',
-                                                                     test='sum(test)') \
-                     & 'train>0 and test>0'
+        train_test = (dj.U(*UNIQUE_FRAME[cond['stimulus_type']]).aggr(frames * stim,
+                                                                      train='sum(1-test)',
+                                                                      test='sum(test)') &
+                      'train>0 and test>0')
         assert len(train_test) == 0, 'Train and test clips do overlap'
 
     def fill_up(self, tier, frames, cond, key, m):
@@ -270,26 +237,24 @@ class ConditionTier(dj.Computed):
         # "stimulus.Frame","stimulus.MonetFrame", "stimulus.TrippyFrame"
         conditions = dj.U('stimulus_type').aggr(stimulus.Condition() & (stimulus.Trial() & key),
                                                 count='count(*)') \
-                     & 'stimulus_type in ("stimulus.Frame","stimulus.MonetFrame", "stimulus.TrippyFrame")'
+                     & 'stimulus_type in ("stimulus.Frame", "stimulus.MonetFrame", "stimulus.TrippyFrame", "stimulus.ColorFrameProjector")'
         for cond in conditions.fetch(as_dict=True):
             # hack for compatibility with previous datasets
-            if cond['stimulus_type'] == 'stimulus.Frame':
+            if cond['stimulus_type'] in ['stimulus.Frame', 'stimulus.ColorFrameProjector']:
+                frame_table = (stimulus.Frame if cond['stimulus_type'] == 'stimulus.Frame' else stimulus.ColorFrameProjector)
 
                 # deal with ImageNet frames first
-                log.info('Inserting assignment from Mesonet')
-                assignment = dj.U('tier', 'image_id') & (stimulus.Frame * mesonet.MesonetSplit.proj(tier='type') & 'image_class = "imagenet"')
-
-                targets = StaticScan * stimulus.Frame * assignment & (stimulus.Trial & key) & 'image_class = "imagenet"'
+                log.info('Inserting assignment from ImageNetSplit')
+                targets = StaticScan * frame_table * ImageNetSplit & (stimulus.Trial & key) & IMAGE_CLASSES
                 print('Inserting {} imagenet conditions!'.format(len(targets)))
-                self.insert(targets,
-                            ignore_extra_fields=True)
+                self.insert(targets, ignore_extra_fields=True)
 
                 # deal with MEI images, assigning tier test for all images
-                assignment = (stimulus.Frame() & 'image_class in ("cnn_mei", "lin_rf", "multi_cnn_mei", "multi_lin_rf")').proj(tier='"train"')
-                self.insert(StaticScan * stimulus.Frame * assignment & (stimulus.Trial & key), ignore_extra_fields=True)
+                assignment = (frame_table & 'image_class in ("cnn_mei", "lin_rf", "multi_cnn_mei", "multi_lin_rf")').proj(tier='"train"')
+                self.insert(StaticScan * frame_table * assignment & (stimulus.Trial & key), ignore_extra_fields=True)
 
                 # make sure that all frames were assigned
-                remaining = (stimulus.Trial * stimulus.Frame & key) - self
+                remaining = (stimulus.Trial * frame_table & key) - self
                 assert len(remaining) == 0, 'There are still unprocessed Frames'
                 continue
 
@@ -349,14 +314,8 @@ def process_frame(preproc_key, frame):
     log.info('Downsampling frame')
     if not frame.shape[0] / imgsize[1] == frame.shape[1] / imgsize[0]:
         log.warning('Image size would change aspect ratio.')
-        # if frame.shape == (126, 216):
-        #     log.warning('Using center crop')
-        #     frame = frame[4:4 + 117, 4:4 + 208]
-        # else:
-        #     raise ValueError('Frame shape {} cannot be processed'.format(frame.shape))
 
     return cv2.resize(frame, imgsize, interpolation=cv2.INTER_AREA).astype(np.float32)
-
 
 
 @schema
@@ -373,8 +332,8 @@ class Frame(dj.Computed):
     def key_source(self):
         return stimulus.Condition() * Preprocessing() & ConditionTier()
 
-    def load_frame(self, key):
-
+    @staticmethod
+    def load_frame(key):
         if stimulus.Frame & key:
             assert (stimulus.Frame & key).fetch1('pre_blank_period') > 0, 'we assume blank periods'
             return (stimulus.StaticImage.Image & (stimulus.Frame & key)).fetch1('image')
@@ -384,12 +343,52 @@ class Frame(dj.Computed):
         elif stimulus.TrippyFrame & key:
             assert (stimulus.TrippyFrame & key).fetch1('pre_blank_period') > 0, 'we assume blank periods'
             return (stimulus.TrippyFrame & key).fetch1('img')
+        elif stimulus.ColorFrameProjector & key:
+            # stimulus is type ColorFrameProjector which means we need to look up what channel was map to what and select base on
+            assert (stimulus.ColorFrameProjector & key).fetch1('pre_blank_period') > 0, 'we assume blank periods'
+
+            original_img = (stimulus.StaticImage.Image & (stimulus.ColorFrameProjector & key)).fetch1('image')
+            if len(original_img.shape) == 2:
+                # Only 1 channel
+                return original_img
+            else:
+                # There is more then 1 channel, thus we need get the channel mappings for the project, where the number signifies which RGB channel maps to the project channels
+                channel_mappings = (stimulus.ColorFrameProjector() & key).fetch1('channel_1', 'channel_2', 'channel_3')
+                image_sub_channels_to_include = []
+                for channel_mapping in channel_mappings:
+                    if channel_mapping is not None:
+                        image_sub_channels_to_include.append(original_img[:, :, channel_mapping - 1])
+                return np.stack(image_sub_channels_to_include, axis=-1)
         else:
             raise KeyError('Cannot find matching stimulus relation')
 
+    @staticmethod
+    def get_stimulus_type(scan_key):
+        """
+        Function that returns a list of str indicating what stimulus_types are in the given condition_hash
+
+        Args:
+            scan_key (dict): A key that contains animial_id, session, scan_idx, pipe_version, segmentation_method, and spike_method. Most of the time the first 3 attributes are sufficient
+        
+        Returns:
+            stimulus_types (list<str>): A list of string containing the stimulus_type name(s)
+        """
+        
+        key = ConditionTier & scan_key
+        stimulus_types = []
+
+        if stimulus.Frame & key:
+            stimulus_types.append('stimulus.Frame')
+        if stimulus.MonetFrame & key:
+            stimulus_types.append('stimulus.MonetFrame')
+        if stimulus.TrippyFrame & key:
+            stimulus_types.append('stimulus.TrippyFrame')
+        if stimulus.ColorFrameProjector & key:
+            stimulus_types.append('stimulus.ColorFrameProjector')
+
+        return stimulus_types
+
     def make(self, key):
-
-
         log.info(80 * '-')
         log.info('Processing key ' + pformat(dict(key)))
 
@@ -561,6 +560,8 @@ class InputResponse(dj.Computed, FilterMixin):
         if len(images.shape) == 3:
             log.info('Adding channel dimension')
             images = images[:, None, ...]
+        elif len(images.shape) == 4:
+            images = images.transpose(0, 3, 1, 2)
         hashes = hashes.astype(str)
         types = types.astype(str)
 
@@ -708,6 +709,7 @@ class InputResponse(dj.Computed, FilterMixin):
         if include_behavior:
             retval['behavior'] = behavior
             retval['pupil_center'] = pupil_center
+            
         return retval
 
 
@@ -886,7 +888,18 @@ class Treadmill(dj.Computed, FilterMixin, BehaviorMixin):
             tm[~valid] = -1
 
         self.insert1(dict(scan_key, treadmill=tm, valid=valid))
+    
 
+# Patch job for the hardcoding mess that was StaticMultiDataset.fill()
+# Instead of editing the code each time, the user will enter they scan with the desire group_id into here then call StaticMultiDataset.fill()
+@schema
+class StaticMultiDatasetGroupAssignment(dj.Manual):
+    definition = """
+    group_id : int unsigned
+    -> InputResponse
+    ---
+    description = '' : varchar(1024)
+    """
 
 @schema
 class StaticMultiDataset(dj.Manual):
@@ -906,70 +919,18 @@ class StaticMultiDataset(dj.Manual):
         name                    : varchar(50) unique # string description to be used for training
         """
 
-    _template = 'group{group_id:03d}-{animal_id}-{session}-{scan_idx}-{preproc_id}'
+    @staticmethod
+    def fill():
+        _template = 'group{group_id:03d}-{animal_id}-{session}-{scan_idx}-{preproc_id}'
+        for scan in StaticMultiDatasetGroupAssignment.fetch(as_dict=True):
+            # Check if the scan has been added to StaticMultiDataset.Member, if not then do it
+            if len(StaticMultiDataset & dict(group_id = scan['group_id'])) == 0:
+                # Group id has not been added into StaticMultiDataset, thus add it
+                StaticMultiDataset.insert1(dict(group_id = scan['group_id'], description = scan['description']))
 
-
-    def fill(self):
-        selection = [
-            ('11521-7-1', dict(animal_id=11521, session=7, scan_idx=1, preproc_id=0)),
-            ('11521-7-2', dict(animal_id=11521, session=7, scan_idx=2, preproc_id=0)),
-            ('16157-5-5', dict(animal_id=16157, session=5, scan_idx=5, preproc_id=0)),
-            ('16157-5-6', dict(animal_id=16157, session=5, scan_idx=6, preproc_id=0)),
-            ('16157-5-5-scaled', dict(animal_id=16157, session=5, scan_idx=5, preproc_id=2)),
-            ('16312-3-20', dict(animal_id=16312, session=3, scan_idx=20, preproc_id=0)),
-            ('11521-7-1-scaled', dict(animal_id=11521, session=7, scan_idx=1, preproc_id=2)),
-            ('11521-7-2-scaled', dict(animal_id=11521, session=7, scan_idx=2, preproc_id=2)),
-            ('18765-4-6', dict(animal_id=18765, session=4, scan_idx=6, preproc_id=0)),
-            ('16157-5', [dict(animal_id=16157, session=5, scan_idx=5, preproc_id=0),
-                         dict(animal_id=16157, session=5, scan_idx=6, preproc_id=0)]),
-            ('20505-2-24', dict(animal_id=20505, session=2, scan_idx=24, preproc_id=0)),
-            ('20505-3-7', dict(animal_id=20505, session=3, scan_idx=7, preproc_id=0)),
-            ('20505-6-1', dict(animal_id=20505, session=6, scan_idx=1, preproc_id=0)),
-            ('20505-7-29', dict(animal_id=20505, session=7, scan_idx=29, preproc_id=0)),
-            ('20457-5-9', dict(animal_id=20457, session=5, scan_idx=9, preproc_id=0)),
-            ('20505-10-14', dict(animal_id=20505, session=10, scan_idx=14, preproc_id=0)),
-            ('20457-7-10', dict(animal_id=20457, session=7, scan_idx=10, preproc_id=0)),
-            ('20457-8-12', dict(animal_id=20457, session=8, scan_idx=12, preproc_id=0)),
-            ('20505-12-29', dict(animal_id=20505, session=12, scan_idx=29, preproc_id=0)),
-            ('20505-14-33', dict(animal_id=20505, session=14, scan_idx=33, preproc_id=0)),
-            ('20505-11-16', dict(animal_id=20505, session=11, scan_idx=16, preproc_id=0)),
-            ('20210-4-11', dict(animal_id=20210, session=4, scan_idx=11, preproc_id=0)),
-            ('20892-3-14', dict(animal_id=20892, session=3, scan_idx=14, preproc_id=0)),
-            ('20892-9-10', dict(animal_id=20892, session=9, scan_idx=10, preproc_id=0)),
-            ('20210-5-16', dict(animal_id=20210, session=5, scan_idx=16, preproc_id=0)),
-            ('20210-7-14', dict(animal_id=20210, session=7, scan_idx=14, preproc_id=0)),
-            ('20210-8-17', dict(animal_id=20210, session=8, scan_idx=17, preproc_id=0)),
-            ('20892-6-24', dict(animal_id=20892, session=6, scan_idx=24, preproc_id=0)),
-            ('20505-10-14-gamma', dict(animal_id=20505, session=10, scan_idx=14, preproc_id=3)),
-            ('21067-9-17', dict(animal_id=21067, session=9, scan_idx=17, preproc_id=0)),
-            ('21067-15-9', dict(animal_id=21067, session=15, scan_idx=9, preproc_id=0)),
-            ('20892-10-10', dict(animal_id=20892, session=10, scan_idx=10, preproc_id=0)),
-            ('20457-5-17', dict(animal_id=20457, session=5, scan_idx=17, preproc_id=0)),
-            ('20505-10-19', dict(animal_id=20505, session=10, scan_idx=19, preproc_id=0)),
-            ('20892-4-16', dict(animal_id=20892, session=4, scan_idx=16, preproc_id=0)),
-            ('21067-10-18', dict(animal_id=21067, session=10, scan_idx=18, preproc_id=0)),
-            ('21067-11-21', dict(animal_id=21067, session=11, scan_idx=21, preproc_id=0)),
-            ('21067-12-15', dict(animal_id=21067, session=12, scan_idx=15, preproc_id=0)),
-            ('21067-13-14', dict(animal_id=21067, session=13, scan_idx=14, preproc_id=0)),
-            ('21553-11-10', dict(animal_id=21553, session=11, scan_idx=10, preproc_id=0)),
-            ('20892-9-11', dict(animal_id=20892, session=9, scan_idx=11, preproc_id=0)),
-            ('21844-2-12', dict(animal_id=21844, session=2, scan_idx=12, preproc_id=0)),
-            ('22085-2-20', dict(animal_id=22085, session=2, scan_idx=20, preproc_id=0)),
-            ('22083-7-21', dict(animal_id=22083, session=7, scan_idx=21, preproc_id=0)),
-        ]
-        for group_id, (descr, key) in enumerate(selection):
-            entry = dict(group_id=group_id, description=descr)
-            if entry in self:
-                print('Already found entry', entry)
-            else:
-                with self.connection.transaction:
-                    if not (InputResponse() & key):
-                        ValueError('Dataset not found')
-                    self.insert1(entry)
-                    for k in (InputResponse() & key).fetch(dj.key):
-                        k = dict(entry, **k)
-                        name = self._template.format(**k)
-                        self.Member().insert1(dict(k, name=name), ignore_extra_fields=True)
+            # Handle instertion into Member table
+            if len(StaticMultiDataset.Member() & scan) == 0:
+                StaticMultiDataset.Member().insert1(dict(scan, name = _template.format(**scan)), ignore_extra_fields=True)
 
     def fetch_data(self, key, key_order=None):
         assert len(self & key) == 1, 'Key must refer to exactly one multi dataset'
@@ -988,7 +949,7 @@ class StaticMultiDataset(dj.Manual):
 
             h5filename = InputResponse().get_filename(mkey)
             log.info('Loading dataset {} --> {}'.format(name, h5filename))
-            ret[name] = StaticImageSet(h5filename, *data_names)
+            ret[name] = datasets.StaticImageSet(h5filename, *data_names)
         if key_order is not None:
             log.info('Reordering datasets according to given key order {}'.format(', '.join(key_order)))
             ret = OrderedDict([
